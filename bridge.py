@@ -1179,6 +1179,8 @@ def _public_state():
             "page_bound": bool(state.get("page_id")),
             "can_retry": False,
         }
+        if state.get("error"):
+            st["error"] = str(state.get("error"))[:500]
         if state.get("archive_id"):
             st["archive_id"] = state.get("archive_id")
         if state.get("meeting_id"):
