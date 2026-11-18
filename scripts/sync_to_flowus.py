@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -69,6 +70,59 @@ def run_flowus_ok(args, body_path=None):
             return data, False
         raise RuntimeError(f"flowus command failed (code={code}): {err or out}")
     return data, True
+
+
+# FlowUs rejects uploads above 100 MB ("File size exceeds 100MB limit").
+UPLOAD_LIMIT_BYTES = 100 * 1024 * 1024
+UPLOAD_SAFE_BYTES = 95 * 1024 * 1024  # headroom for multipart overhead
+
+
+def _transcode_audio(src, work_dir):
+    """Shrink an oversized wav with ffmpeg; return ((path, bitrate)) or None."""
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return None
+    out = os.path.join(work_dir, "microphone.mp3")
+    # 64k mono keeps ~2.5h under the limit; drop lower only for very long recordings.
+    for bitrate in ("64k", "32k", "16k"):
+        try:
+            subprocess.run(
+                [ff, "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-b:a", bitrate, out],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600,
+            )
+        except Exception:
+            continue
+        if os.path.exists(out):
+            if os.path.getsize(out) <= UPLOAD_SAFE_BYTES:
+                return out, bitrate
+            os.remove(out)
+    return None
+
+
+def prepare_audio(wav_path, work_dir):
+    """Return (path_to_upload, label), or (None, label) when audio must be skipped.
+
+    Hex records uncompressed wav (~220 MB/hour), so anything past roughly 25
+    minutes exceeds the 100 MB FlowUs upload limit. Compress with ffmpeg when it
+    is available; otherwise skip the audio block and say why -- the note itself
+    still has to land on the page.
+    """
+    try:
+        size = os.path.getsize(wav_path)
+    except OSError:
+        return None, "（音频文件不可读）"
+    mb = size / 1024 / 1024
+    if size <= UPLOAD_SAFE_BYTES:
+        return wav_path, f"microphone.wav（{mb:.1f} MB）"
+    converted = _transcode_audio(wav_path, work_dir)
+    if converted:
+        path, bitrate = converted
+        out_mb = os.path.getsize(path) / 1024 / 1024
+        return path, f"microphone.mp3（{out_mb:.1f} MB，由 {mb:.0f} MB wav 转码，{bitrate}）"
+    return None, (
+        f"录音 {mb:.0f} MB，超过 FlowUs 100 MB 上传上限，本次未上传音频。"
+        f"本地原始文件：{wav_path}"
+    )
 
 
 def load_meeting(meeting_id=None, meetings_dir=None):
@@ -269,7 +323,7 @@ def page_contains_marker(page_id, archive_id):
     return False, None
 
 
-def build_beautified_blocks(meeting, transcript, summary_text, oss_name, size, mindmap_url, archive_id=None):
+def build_beautified_blocks(meeting, transcript, summary_text, oss_name, size, mindmap_url, archive_id=None, audio_label=None):
     m = meeting["manifest"]
     mid = meeting["id"]
     created_ms = m.get("created_at_ms") or 0
@@ -312,7 +366,11 @@ def build_beautified_blocks(meeting, transcript, summary_text, oss_name, size, m
     blocks.append(divider())
 
     blocks.append(heading2("原始资料", color="blue"))
-    audio_col = [callout("原始录音", "🎧", bg="light_blue", children=[para(f"microphone.wav（{round((size or 0)/1024/1024, 2)} MB）"), file_block(oss_name, size or 0)])]
+    if oss_name:
+        audio_children = [para(audio_label or f"microphone.wav（{round((size or 0)/1024/1024, 2)} MB）"), file_block(oss_name, size or 0)]
+    else:
+        audio_children = [para(audio_label or "（音频未上传）")]
+    audio_col = [callout("原始录音", "🎧", bg="light_blue", children=audio_children)]
     mm_children = [para(mindmap_url or "（未生成思维导图）")]
     mm_col = [callout("思维导图", "🧠", bg="light_purple", children=mm_children)]
     blocks.append(column_list([(1, audio_col), (1, mm_col)]))
@@ -401,17 +459,24 @@ def main():
         # inconclusive check (network/read error): proceed cautiously (no false-skip), but caller may treat uncertainty separately if needed.
 
     # Upload audio (or reuse from a previous partial attempt)
+    audio_label = None
     if args.reuse_upload_oss_name:
         oss_name = args.reuse_upload_oss_name
         size = int(args.reuse_upload_size or 0)
         print("UPLOAD_REUSE", oss_name, size)
     else:
-        up, ok = run_flowus_ok(["--json", "file", "upload", "--parent-page", page_id, meeting["wav"]])
-        if not ok:
-            print(json.dumps(up, ensure_ascii=False, indent=2)); sys.exit(1)
-        oss_name = up["data"]["oss_name"]
-        size = up["data"].get("size", 0)
-        print("UPLOAD_OK", oss_name, size)
+        upload_path, audio_label = prepare_audio(meeting["wav"], work_dir)
+        if upload_path is None:
+            oss_name = None
+            size = 0
+            print("UPLOAD_SKIPPED", audio_label)
+        else:
+            up, ok = run_flowus_ok(["--json", "file", "upload", "--parent-page", page_id, upload_path])
+            if not ok:
+                print(json.dumps(up, ensure_ascii=False, indent=2)); sys.exit(1)
+            oss_name = up["data"]["oss_name"]
+            size = up["data"].get("size", 0)
+            print("UPLOAD_OK", oss_name, size)
 
     # Mindmap (optional, or reuse)
     mindmap_url = args.reuse_mindmap_url or None
@@ -439,9 +504,13 @@ def main():
         children = []
         if args.archive_id:
             children.append(para(f"归档标识：{marker_text(args.archive_id)}"))
-        children += [para(f"会议 {meeting['id']} {date_str}"), para(summary_text), para((meeting.get("transcript") or "")[:3000]), file_block(oss_name, size)]
+        children += [para(f"会议 {meeting['id']} {date_str}"), para(summary_text), para((meeting.get("transcript") or "")[:3000])]
+        if oss_name:
+            children.append(file_block(oss_name, size))
+        else:
+            children.append(para(audio_label or "（音频未上传）"))
     else:
-        children = build_beautified_blocks(meeting, meeting.get("transcript") or "", summary_text, oss_name, size, mindmap_url, archive_id=args.archive_id)
+        children = build_beautified_blocks(meeting, meeting.get("transcript") or "", summary_text, oss_name, size, mindmap_url, archive_id=args.archive_id, audio_label=audio_label)
 
     # Append blocks
     for i in range(0, len(children), 80):
