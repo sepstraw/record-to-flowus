@@ -1574,7 +1574,34 @@ def ensure_ollama(wait_sec=12.0):
     return "failed"
 
 
+def _ensure_stdio():
+    """Give headless launches (pythonw, e.g. the autostart VBS) real streams.
+
+    pythonw has no console, so sys.stdout/sys.stderr are None. BaseHTTPRequestHandler
+    writes one access-log line per request to sys.stderr; writing to None raises
+    inside the handler and the client sees the connection reset while the port stays
+    bound -- the bridge looks alive but answers nothing. Point both at a log file.
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    stream = None
+    try:
+        log_dir = os.path.join(os.environ.get("APPDATA") or BASE_DIR, "hex-flowus-voice-note")
+        os.makedirs(log_dir, exist_ok=True)
+        stream = open(os.path.join(log_dir, "bridge.log"), "a", encoding="utf-8", buffering=1)
+    except Exception:
+        try:
+            stream = open(os.devnull, "w")
+        except Exception:
+            return
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
 if __name__ == "__main__":
+    _ensure_stdio()
     if "--check" in sys.argv:
         # lightweight config/startup checks without serving
         start_ok = True
